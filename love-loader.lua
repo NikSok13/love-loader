@@ -2,9 +2,10 @@ require "love.filesystem"
 require "love.image"
 require "love.audio"
 require "love.sound"
+require "love.graphics"
 
 local loader = {
-  _VERSION     = 'love-loader v2.0.3',
+  _VERSION     = 'love-loader v2.0.4',
   _DESCRIPTION = 'Threaded resource loading for LÖVE',
   _URL         = 'https://github.com/kikito/love-loader',
   _LICENSE     = [[
@@ -34,7 +35,7 @@ local loader = {
 }
 
 local resourceKinds = {
-  image = {
+    image = {
     requestKey  = "imagePath",
     resourceKey = "imageData",
     constructor = function (path)
@@ -105,80 +106,40 @@ local resourceKinds = {
   }
 }
 
+
 local CHANNEL_PREFIX = "loader_"
 
 local loaded = ...
 if loaded == true then
   local requestParams, resource
   local done = false
-
   local doneChannel = love.thread.getChannel(CHANNEL_PREFIX .. "is_done")
-
   while not done do
-
     for _,kind in pairs(resourceKinds) do
       local loader = love.thread.getChannel(CHANNEL_PREFIX .. kind.requestKey)
-      requestParams = loader:pop()
-      if requestParams then
-        resource = kind.constructor(unpack(requestParams))
-        local producer = love.thread.getChannel(CHANNEL_PREFIX .. kind.resourceKey)
-        producer:push(resource)
+      local producer = love.thread.getChannel(CHANNEL_PREFIX .. kind.resourceKey)
+      res = loader:pop()
+      if res then
+        producer:push({key = res.key, data = kind.constructor(unpack(res.data))})
       end
     end
-
-    done = doneChannel:pop()
+    done = doneChannel:peek()
   end
+  return
+end
 
-else
+local thread_count = 2
+local pending = {}
+local callbacks = {}
+local pathToThisFile = (...):gsub("%.", "/") .. ".lua"
 
-  local pending = {}
-  local callbacks = {}
-  local resourceBeingLoaded
+local function newResource(kind, holder, key, ...)
+  pending[#pending + 1] = {
+    kind = kind, holder = holder, key = key, requestParams = {...}
+  }
+end
 
-  local pathToThisFile = (...):gsub("%.", "/") .. ".lua"
-
-  local function shift(t)
-    return table.remove(t,1)
-  end
-
-  local function newResource(kind, holder, key, ...)
-    pending[#pending + 1] = {
-      kind = kind, holder = holder, key = key, requestParams = {...}
-    }
-  end
-
-  local function getResourceFromThreadIfAvailable()
-    local data, resource
-    for name,kind in pairs(resourceKinds) do
-      local channel = love.thread.getChannel(CHANNEL_PREFIX .. kind.resourceKey)
-      data = channel:pop()
-      if data then
-        resource = kind.postProcess and kind.postProcess(data, resourceBeingLoaded) or data
-        resourceBeingLoaded.holder[resourceBeingLoaded.key] = resource
-        loader.loadedCount = loader.loadedCount + 1
-        callbacks.oneLoaded(resourceBeingLoaded.kind, resourceBeingLoaded.holder, resourceBeingLoaded.key)
-        resourceBeingLoaded = nil
-      end
-    end
-  end
-
-  local function requestNewResourceToThread()
-    resourceBeingLoaded = shift(pending)
-    local requestKey = resourceKinds[resourceBeingLoaded.kind].requestKey
-    local channel = love.thread.getChannel(CHANNEL_PREFIX .. requestKey)
-    channel:push(resourceBeingLoaded.requestParams)
-  end
-
-  local function endThreadIfAllLoaded()
-    if not resourceBeingLoaded and #pending == 0 then
-      love.thread.getChannel(CHANNEL_PREFIX .. "is_done"):push(true)
-      callbacks.allLoaded()
-    end
-  end
-
-  -----------------------------------------------------
-
-  function loader.newImage(holder, key, path)
+function loader.newImage(holder, key, path)
     newResource('image', holder, key, path)
   end
 
@@ -207,36 +168,47 @@ else
     newResource('compressedData', holder, key, path)
   end
 
-  function loader.start(allLoadedCallback, oneLoadedCallback)
 
-    callbacks.allLoaded = allLoadedCallback or function() end
-    callbacks.oneLoaded = oneLoadedCallback or function() end
-
+function loader.start(allLoadedCallback, oneLoadedCallback)
+ 
+  callbacks.allLoaded = allLoadedCallback or function() end
+  callbacks.oneLoaded = oneLoadedCallback or function() end
+ 
+  loader.threads = {}
+  loader.loadedCount = 0
+  for i = 1, thread_count do
     local thread = love.thread.newThread(pathToThisFile)
-
-    loader.loadedCount = 0
-    loader.resourceCount = #pending
     thread:start(true)
-    loader.thread = thread
+    loader.threads[i] = thread
   end
+  for k,v in pairs(pending) do
+    local channel = love.thread.getChannel(CHANNEL_PREFIX .. resourceKinds[v.kind].requestKey)
+    channel:push({key = k, data = v.requestParams})
+  end
+end
 
-  function loader.update()
-    if loader.thread then
-      if loader.thread:isRunning() then
-        if resourceBeingLoaded then
-          getResourceFromThreadIfAvailable()
-        elseif #pending > 0 then
-          requestNewResourceToThread()
-        else
-          endThreadIfAllLoaded()
-          loader.thread = nil
+function loader.update()
+  if loader.threads[1] and loader.threads[1]:isRunning()  then
+    for name, kind in pairs(resourceKinds) do
+      local channel = love.thread.getChannel(CHANNEL_PREFIX .. kind.resourceKey)
+      local data = channel:pop()
+      if data then
+        local i = pending[data.key]
+        if i then
+          i.holder[i.key] = kind.postProcess and kind.postProcess(data.data, i) or data.data
+          loader.loadedCount = loader.loadedCount + 1
+          callbacks.oneLoaded(i.kind, i.holder, i.key)
         end
-      else
-        local errorMessage = loader.thread:getError()
-        assert(not errorMessage, errorMessage)
       end
+    end         
+    if #pending == loader.loadedCount then
+      love.thread.getChannel(CHANNEL_PREFIX .. "is_done"):push(true)
+      for k,v in pairs(loader.threads) do
+        loader.threads[k] = nil
+      end
+      callbacks.allLoaded()
     end
   end
-
-  return loader
 end
+
+return loader
